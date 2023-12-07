@@ -31,11 +31,11 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
 {
     uint2 dispatchThreadId = localId + groupId * uint2(TILE_SIZE, TILE_SIZE);
     int2 currentPixelIndex = dispatchThreadId;
-	
+    
     float2 pixelCenter = float2(currentPixelIndex) + 0.5f;
     float2 viewportUV = pixelCenter * viewportInv;
     float2 screenPos = viewportUV;
-	
+    
     const float distanceHalfTop = tipTopDistance.y;
 
     uint fullX = motionReprojFullX[currentPixelIndex];
@@ -46,13 +46,13 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
     float2 samplePosFull = screenPos - motionVectorFull * distanceHalfTop;
     float2 motionCaliberatedUVFull = samplePosFull;
     motionCaliberatedUVFull = clamp(motionCaliberatedUVFull, float2(0.0f, 0.0f), float2(1.0f, 1.0f));
-    float2 motionFullCaliberated = currMotionUnprojected.SampleLevel(bilinearClampedSampler, motionCaliberatedUVFull, 0) * viewportInv;
+    float2 motionFullCaliberated = currMotionUnprojected.SampleLevel(bilinearClampedSampler, motionCaliberatedUVFull, 0);
     if (all(abs(motionFullCaliberated) < viewportInv))
     {
         motionFullCaliberated = -ComputeStaticVelocityTopTip(screenPos, prevDepthTexture.SampleLevel(bilinearClampedSampler, motionCaliberatedUVFull, 0).r, prevClipToClip);
     }
     
-	{
+    {
         bool bIsValidhistoryPixel = all(uint2(currentPixelIndex) < dimensions);
         if (bIsValidhistoryPixel)
         {

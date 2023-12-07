@@ -3,7 +3,7 @@
 
 #include "include/sl.h"
 #include "include/sl_consts.h"
-#include "include/sl_phsr_g.h"
+#include "include/sl_mtss_g.h"
 #include "source/core/sl.log/log.h"
 #include "source/core/sl.plugin/plugin.h"
 #include "source/core/sl.param/parameters.h"
@@ -12,13 +12,14 @@
 #include "source/plugins/sl.common/commonInterface.h"
 #include "external/json/include/nlohmann/json.hpp"
 #include "_artifacts/gitVersion.h"
+#include "_artifacts/shaders/phsr_fg_clearing_cs.h"
 #include "_artifacts/shaders/phsr_fg_firstleg_cs.h"
-#include "_artifacts/shaders/phsr_fg_pushing_cs.h"
 #include "_artifacts/shaders/phsr_fg_laststretch_cs.h"
+#include "_artifacts/shaders/phsr_fg_pushing_cs.h"
 #include "_artifacts/shaders/phsr_fg_pulling_cs.h"
 #include "_artifacts/shaders/phsr_fg_mergingfull_cs.h"
 #include "_artifacts/shaders/phsr_fg_merginghalf_cs.h"
-#include "_artifacts/shaders/phsr_fg_clearing_cs.h"
+#include "_artifacts/shaders/phsr_fg_normalizing_cs.h"
 #include "_artifacts/shaders/phsr_fg_reprojection_cs.h"
 #include "_artifacts/shaders/phsr_fg_resolution_cs.h"
 
@@ -29,16 +30,16 @@ using json = nlohmann::json;
 namespace sl
 {
 
-namespace phsrg
+namespace mtssg
 {
 
-#define phsrFG_PERF 0
-#define phsrFG_DPF  0
-#define phsrFG_IMGUI 1
+#define MTSSFG_PERF 0
+#define MTSSFG_DPF  0
+#define MTSSFG_IMGUI 1
 
-#define phsrFG_NOT_TEST() SL_LOG_WARN("This Path Not Test, Maybe Not Work")
+#define MTSSFG_NOT_TEST() SL_LOG_WARN("This Path Not Test, Maybe Not Work")
 
-#define phsrFG_BEGIN_PERF(_expr, section)           \
+#define MTSSFG_BEGIN_PERF(_expr, section)           \
     {                                               \
         bool _expr_eval = static_cast<bool>(_expr); \
         if (_expr_eval)                             \
@@ -47,7 +48,7 @@ namespace phsrg
         }                                           \
     }
 
-#define phsrFG_END_PERF(_expr, section)             \
+#define MTSSFG_END_PERF(_expr, section)             \
     {                                               \
         bool _expr_eval = static_cast<bool>(_expr); \
         if (_expr_eval)                             \
@@ -57,6 +58,14 @@ namespace phsrg
     }
 
 struct ClearingConstParamStruct
+{
+    sl::uint2  dimensions;
+    sl::float2 tipTopDistance;
+    sl::float2 viewportSize;
+    sl::float2 viewportInv;
+};
+
+struct NormalizingConstParamStruct
 {
     sl::uint2  dimensions;
     sl::float2 tipTopDistance;
@@ -106,9 +115,9 @@ enum class PresentApi : uint8_t
     Present1,
 };
 
-struct phsrGContext
+struct MTSSGContext
 {
-    SL_PLUGIN_CONTEXT_CREATE_DESTROY(phsrGContext);
+    SL_PLUGIN_CONTEXT_CREATE_DESTROY(MTSSGContext);
 
     // Called when plugin is loaded, do any custom constructor initialization here
     void onCreateContext(){};
@@ -137,6 +146,8 @@ struct phsrGContext
     sl::chi::Resource motionReprojectedHalfTip{};
     sl::chi::Resource motionReprojectedHalfTop{};
 
+    sl::chi::Resource currMvecDuplicated{};
+    sl::chi::Resource prevMvecDuplicated{};
     sl::chi::Resource currMvecFiltered{};
     sl::chi::Resource prevMvecFiltered{};
 
@@ -166,6 +177,7 @@ struct phsrGContext
     chi::CommandQueue         cmdCopyQueue{};
 
     sl::chi::Kernel clearKernel;
+    sl::chi::Kernel normalizeKernel;
     sl::chi::Kernel reprojectionKernel;
     sl::chi::Kernel mergeKernelHalf;
     sl::chi::Kernel mergeKernelFull;
@@ -186,15 +198,15 @@ struct phsrGContext
     uint32_t frameId    = 1;
     uint32_t viewportId = 0;
 
-    phsrGOptions options;
-    phsrGState   state;
+    MTSSGOptions options;
+    MTSSGState   state;
 
-#if phsrFG_IMGUI
+#if MTSSFG_IMGUI
     sl::ImGuiDebugOverlay* pDebugOverlay;
 #endif
 };
 
-} // namespace phsrg
+} // namespace mtssg
 
 void updateEmbeddedJSON(json& config);
 
@@ -202,8 +214,8 @@ static const char* JSON = R"json(
 {
     "id" : 10000,
     "priority" : 1000,
-    "name" : "sl.phsr_g",
-    "namespace" : "phsr_g",
+    "name" : "sl.mtss_g",
+    "namespace" : "mtss_g",
     "required_plugins" : ["sl.common"],
     "exculusive_hooks" : ["IDXGISwapChain_GetCurrentBackBufferIndex", "IDXGISwapChain_GetBuffer"],
     "rhi" : ["d3d11"],
@@ -263,19 +275,19 @@ static const char* JSON = R"json(
 )json";
 
 //! Define our plugin, make sure to update version numbers in versions.h
-SL_PLUGIN_DEFINE("sl.phsr_g",
+SL_PLUGIN_DEFINE("sl.mtss_g",
                  Version(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH),
                  Version(0, 0, 1),
                  JSON,
                  updateEmbeddedJSON,
-                 phsrg,
-                 phsrGContext)
+                 mtssg,
+                 MTSSGContext)
 
-namespace phsrg
+namespace mtssg
 {
 sl::chi::ComputeStatus destroyResource(sl::chi::Resource* pResource, uint32_t frameDelay = 0)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     auto ret   = ctx.pCompute->destroyResource(*pResource, frameDelay);
     *pResource = nullptr;
@@ -285,7 +297,7 @@ sl::chi::ComputeStatus destroyResource(sl::chi::Resource* pResource, uint32_t fr
 
 sl::chi::ComputeStatus cloneResource(sl::chi::Resource resource, sl::chi::Resource& clone, const char friendlyName[])
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(destroyResource(&clone));
     CHI_VALIDATE(ctx.pCompute->cloneResource(resource, clone, friendlyName));
@@ -295,7 +307,7 @@ sl::chi::ComputeStatus cloneResource(sl::chi::Resource resource, sl::chi::Resour
 
 sl::chi::ComputeStatus copyResource(sl::chi::Resource& dst, sl::chi::Resource& src)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(ctx.pCompute->copyResource(ctx.pCmdList->getCmdList(), dst, src));
 
@@ -304,14 +316,14 @@ sl::chi::ComputeStatus copyResource(sl::chi::Resource& dst, sl::chi::Resource& s
 
 bool IsContextStatusOk()
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
-    return ctx.state.status == phsrGStatus::eOk;
+    return ctx.state.status == MTSSGStatus::eOk;
 }
 
 uint32_t calcResourceUsageBytes(const sl::chi::Resource& resource, uint32_t count = 1)
 {
-    auto&    ctx        = (*phsrg::getContext());
+    auto&    ctx        = (*mtssg::getContext());
     uint32_t usageBytes = 0;
 
     sl::chi::Format chiFormat{};
@@ -330,13 +342,18 @@ uint32_t calcResourceUsageBytes(const sl::chi::Resource& resource, uint32_t coun
 
 uint32_t calcEstimatedVRAMUsageInBytes()
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     uint32_t vRAMUsageInBytes = 0;
 
     {
         // generatedFrame, appSurfaceBackup
         vRAMUsageInBytes += calcResourceUsageBytes(ctx.generatedFrame, 2);
+    }
+
+    {
+        // filtered curr/prevMvec, duplicated curr/prevMvec
+        vRAMUsageInBytes += calcResourceUsageBytes(ctx.currMvecFiltered, 4);
     }
 
     {
@@ -404,7 +421,7 @@ uint32_t calcEstimatedVRAMUsageInBytes()
 
 void destroyFrameGenerationResource()
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(destroyResource(&ctx.appSurfaceBackup));
     CHI_VALIDATE(destroyResource(&ctx.prevDepth));
@@ -425,6 +442,8 @@ void destroyFrameGenerationResource()
 
     CHI_VALIDATE(destroyResource(&ctx.currMvecFiltered));
     CHI_VALIDATE(destroyResource(&ctx.prevMvecFiltered));
+    CHI_VALIDATE(destroyResource(&ctx.currMvecDuplicated));
+    CHI_VALIDATE(destroyResource(&ctx.prevMvecDuplicated));
 
     CHI_VALIDATE(destroyResource(&ctx.motionReprojectedFullFiltered));
     CHI_VALIDATE(destroyResource(&ctx.motionReprojectedHalfTipFiltered));
@@ -448,17 +467,17 @@ void destroyFrameGenerationResource()
 
 void createGeneratedFrame(uint32_t width, uint32_t height, DXGI_FORMAT format)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     if (width < ctx.state.minWidthOrHeight || height < ctx.state.minWidthOrHeight)
     {
-        SL_LOG_WARN("SwapChain Resolution Is Too Low, Please Check phsrGState.minWidthOrHeight For Minimum Supported "
-                    "Resolution. phsr-FG Will Do Nothing!");
-        ctx.state.status = phsrGStatus::eFailResolutionTooLow;
+        SL_LOG_WARN("SwapChain Resolution Is Too Low, Please Check MTSSGState.minWidthOrHeight For Minimum Supported "
+                    "Resolution. MTSS-FG Will Do Nothing!");
+        ctx.state.status = MTSSGStatus::eFailResolutionTooLow;
     }
     else
     {
-        ctx.state.status = phsrGStatus::eOk;
+        ctx.state.status = MTSSGStatus::eOk;
     }
 
     if ((IsContextStatusOk()) && ((ctx.generatedFrame == nullptr) || (ctx.swapChainWidth != width) ||
@@ -507,6 +526,8 @@ void createGeneratedFrame(uint32_t width, uint32_t height, DXGI_FORMAT format)
 
         CHI_VALIDATE(ctx.pCompute->createTexture2D(desc, ctx.currMvecFiltered, "motionUnprojectedCurrFiltered"));
         CHI_VALIDATE(ctx.pCompute->createTexture2D(desc, ctx.prevMvecFiltered, "motionUnprojectedPrevFiltered"));
+        CHI_VALIDATE(ctx.pCompute->createTexture2D(desc, ctx.currMvecDuplicated, "motionUnprojectedCurrDuplicated"));
+        CHI_VALIDATE(ctx.pCompute->createTexture2D(desc, ctx.prevMvecDuplicated, "motionUnprojectedPrevDuplicated"));
 
         CHI_VALIDATE(ctx.pCompute->createTexture2D(desc, ctx.motionReprojectedFullFiltered, "motionReprojectedFullFiltered"));
         CHI_VALIDATE(ctx.pCompute->createTexture2D(desc, ctx.motionReprojectedHalfTipFiltered, "motionReprojectedTipFiltered"));
@@ -553,7 +574,7 @@ void createGeneratedFrame(uint32_t width, uint32_t height, DXGI_FORMAT format)
                     ctx.state.estimatedVRAMUsageInBytes,
                     ctx.state.estimatedVRAMUsageInBytes / 1024 / 1024);
 
-#if phsrFG_IMGUI
+#if MTSSFG_IMGUI
         ctx.pDebugOverlay->DeInit();
 
         ctx.pDebugOverlay->Init(ctx.swapChainWidth, ctx.swapChainHeight, ctx.swapChainFormat);
@@ -563,7 +584,7 @@ void createGeneratedFrame(uint32_t width, uint32_t height, DXGI_FORMAT format)
 
 bool checkTagedResourceUpdate(uint32_t viewportId)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     sl::CommonResource hudLessRes{};
     getTaggedResource(kBufferTypeHUDLessColor, hudLessRes, viewportId);
@@ -591,7 +612,7 @@ bool checkTagedResourceUpdate(uint32_t viewportId)
 
 sl::Result acquireTaggedResource(uint32_t viewportId)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     sl::Result ret = getTaggedResource(kBufferTypeHUDLessColor, ctx.currHudLessColor, viewportId);
 
@@ -618,7 +639,7 @@ sl::Result acquireTaggedResource(uint32_t viewportId)
     if (ret != sl::Result::eOk)
     {
         SL_LOG_ERROR("Acqueire FG Tagged Resource Fail");
-        ctx.state.status = phsrGStatus::eFailTagResourcesInvalid;
+        ctx.state.status = MTSSGStatus::eFailTagResourcesInvalid;
     }
 
     return ret;
@@ -631,7 +652,7 @@ sl::Result cloneTaggedResource(const sl::CommonResource& currHudLessColor,
                                sl::chi::Resource&        clonedDepth,
                                sl::chi::Resource&        clonedMvec)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(cloneResource(currHudLessColor, clonedHudLessColor, "prev hudless color"));
     CHI_VALIDATE(cloneResource(currDepth, clonedDepth, "prev depth"));
@@ -642,8 +663,8 @@ sl::Result cloneTaggedResource(const sl::CommonResource& currHudLessColor,
 
 void beginPerfSection(const char* section)
 {
-#if SL_ENABLE_TIMING && phsrFG_PERF
-    auto& ctx = (*phsrg::getContext());
+#if SL_ENABLE_TIMING && MTSSFG_PERF
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(ctx.pCompute->beginPerfSection(ctx.pCmdList->getCmdList(), section, 0, true));
 #endif
@@ -651,8 +672,8 @@ void beginPerfSection(const char* section)
 
 void endPerfSection(const char* section)
 {
-#if SL_ENABLE_TIMING && phsrFG_PERF
-    auto& ctx = (*phsrg::getContext());
+#if SL_ENABLE_TIMING && MTSSFG_PERF
+    auto& ctx = (*mtssg::getContext());
 
     float costMs = 0.0f;
     CHI_VALIDATE(ctx.pCompute->endPerfSection(ctx.pCmdList->getCmdList(), section, costMs));
@@ -661,7 +682,7 @@ void endPerfSection(const char* section)
 #endif
 }
 
-void addPushPullPasses(const sl::chi::Resource& input, sl::chi::Resource& output, sl::phsrg::phsrGContext& ctx, const int layers = 3)
+void addPushPullPasses(const sl::chi::Resource& input, sl::chi::Resource& output, sl::mtssg::MTSSGContext& ctx, const int layers = 3)
 {
     if (layers == 0)
     {
@@ -825,9 +846,9 @@ void addPushPullPasses(const sl::chi::Resource& input, sl::chi::Resource& output
     return;
 }
 
-void processFrameGenerationClearing(sl::phsrg::ClearingConstParamStruct* pCb, uint32_t grid[])
+void processFrameGenerationClearing(sl::mtssg::ClearingConstParamStruct* pCb, uint32_t grid[])
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(ctx.pCompute->bindSharedState(ctx.pCmdList->getCmdList()));
 
@@ -852,14 +873,35 @@ void processFrameGenerationClearing(sl::phsrg::ClearingConstParamStruct* pCb, ui
     CHI_VALIDATE(ctx.pCompute->bindRWTexture(5, 5, {}));
 }
 
-void processFrameGenerationReprojection(sl::phsrg::MVecParamStruct* pCb, uint32_t grid[])
+void processFrameGenerationNormalizing(sl::mtssg::NormalizingConstParamStruct* pCb, uint32_t grid[])
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
+
+    CHI_VALIDATE(ctx.pCompute->bindSharedState(ctx.pCmdList->getCmdList()));
+
+    CHI_VALIDATE(ctx.pCompute->bindKernel(ctx.normalizeKernel));
+
+    CHI_VALIDATE(ctx.pCompute->bindTexture(0, 0, ctx.currMvec));
+    CHI_VALIDATE(ctx.pCompute->bindTexture(1, 1, ctx.prevMvec));
+    CHI_VALIDATE(ctx.pCompute->bindRWTexture(2, 0, ctx.currMvecDuplicated));
+    CHI_VALIDATE(ctx.pCompute->bindRWTexture(3, 1, ctx.prevMvecDuplicated));
+
+    CHI_VALIDATE(ctx.pCompute->bindConsts(4, 0, pCb, sizeof(*pCb), 1));
+
+    CHI_VALIDATE(ctx.pCompute->dispatch(grid[0], grid[1], grid[2]));
+
+    CHI_VALIDATE(ctx.pCompute->bindRWTexture(2, 0, {}));
+    CHI_VALIDATE(ctx.pCompute->bindRWTexture(3, 1, {}));
+}
+
+void processFrameGenerationReprojection(sl::mtssg::MVecParamStruct* pCb, uint32_t grid[])
+{
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(ctx.pCompute->bindKernel(ctx.reprojectionKernel));
 
-    CHI_VALIDATE(ctx.pCompute->bindTexture(0, 0, ctx.currMvecFiltered));
-    CHI_VALIDATE(ctx.pCompute->bindTexture(1, 1, ctx.prevMvecFiltered));
+    CHI_VALIDATE(ctx.pCompute->bindTexture(0, 0, ctx.prevMvecFiltered));
+    CHI_VALIDATE(ctx.pCompute->bindTexture(1, 1, ctx.currMvecFiltered));
     CHI_VALIDATE(ctx.pCompute->bindTexture(2, 2, ctx.prevDepth));
     CHI_VALIDATE(ctx.pCompute->bindTexture(3, 3, ctx.currDepth));
 
@@ -884,9 +926,9 @@ void processFrameGenerationReprojection(sl::phsrg::MVecParamStruct* pCb, uint32_
     CHI_VALIDATE(ctx.pCompute->bindRWTexture(9, 5, {}));
 }
 
-void processFrameGenerationMerging(sl::phsrg::MergeParamStruct* pCb, uint32_t grid[])
+void processFrameGenerationMerging(sl::mtssg::MergeParamStruct* pCb, uint32_t grid[])
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     {
         CHI_VALIDATE(ctx.pCompute->bindKernel(ctx.mergeKernelHalf));
@@ -900,9 +942,9 @@ void processFrameGenerationMerging(sl::phsrg::MergeParamStruct* pCb, uint32_t gr
         CHI_VALIDATE(ctx.pCompute->bindRWTexture(5, 5, ctx.motionReprojectedHalfTop));
 
         CHI_VALIDATE(ctx.pCompute->bindTexture(6, 0, ctx.currMvecFiltered));
-        CHI_VALIDATE(ctx.pCompute->bindTexture(7, 0, ctx.prevMvecFiltered));
-        CHI_VALIDATE(ctx.pCompute->bindTexture(8, 0, ctx.currDepth));
-        CHI_VALIDATE(ctx.pCompute->bindTexture(9, 0, ctx.prevDepth));
+        CHI_VALIDATE(ctx.pCompute->bindTexture(7, 1, ctx.prevMvecFiltered));
+        CHI_VALIDATE(ctx.pCompute->bindTexture(8, 2, ctx.currDepth));
+        CHI_VALIDATE(ctx.pCompute->bindTexture(9, 3, ctx.prevDepth));
 
         CHI_VALIDATE(ctx.pCompute->bindConsts(10, 0, pCb, sizeof(*pCb), 1));
 
@@ -935,9 +977,9 @@ void processFrameGenerationMerging(sl::phsrg::MergeParamStruct* pCb, uint32_t gr
     }
 }
 
-void processFrameGenerationResolution(sl::phsrg::ResolutionConstParamStruct* pCb, uint32_t grid[])
+void processFrameGenerationResolution(sl::mtssg::ResolutionConstParamStruct* pCb, uint32_t grid[])
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     CHI_VALIDATE(ctx.pCompute->bindKernel(ctx.resolutionKernel));
 
@@ -948,13 +990,13 @@ void processFrameGenerationResolution(sl::phsrg::ResolutionConstParamStruct* pCb
 
     CHI_VALIDATE(ctx.pCompute->bindTexture(4, 4, ctx.currMvecFiltered));
 
-    CHI_VALIDATE(ctx.pCompute->bindTexture(5, 5, ctx.motionReprojectedFull));
-    CHI_VALIDATE(ctx.pCompute->bindTexture(6, 6, ctx.motionReprojectedHalfTip));
+    CHI_VALIDATE(ctx.pCompute->bindTexture(5, 5, ctx.motionReprojectedFullFiltered));
+    CHI_VALIDATE(ctx.pCompute->bindTexture(6, 6, ctx.motionReprojectedHalfTipFiltered));
     CHI_VALIDATE(ctx.pCompute->bindTexture(7, 7, ctx.motionReprojectedHalfTopFiltered));
 
     if (static_cast<sl::chi::Resource>(ctx.uiColor)->native != nullptr)
     {
-        CHI_VALIDATE(ctx.pCompute->bindTexture(8, 8, ctx.uiColor));
+        CHI_VALIDATE(ctx.pCompute->bindTexture(8, 8, ctx.currHudLessColor));
     }
 
     CHI_VALIDATE(ctx.pCompute->bindRWTexture(9, 0, ctx.generatedFrame));
@@ -969,10 +1011,10 @@ void processFrameGenerationResolution(sl::phsrg::ResolutionConstParamStruct* pCb
     CHI_VALIDATE(ctx.pCompute->bindRWTexture(9, 0, {}));
 }
 
-void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, const DXGI_PRESENT_PARAMETERS* pPresentParameters, bool firstFrame, sl::phsrg::PresentApi api, UINT seq, UINT tot)
+void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, const DXGI_PRESENT_PARAMETERS* pPresentParameters, bool firstFrame, sl::mtssg::PresentApi api, UINT seq, UINT tot)
 {
-    auto& ctx = (*phsrg::getContext());
-    phsrFG_BEGIN_PERF(onlyCheckKernelPerf, "sl.phsr-fg.kernel");
+    auto& ctx = (*mtssg::getContext());
+    MTSSFG_BEGIN_PERF(onlyCheckKernelPerf, "sl.mtss-fg.kernel");
     // Not first frame and resource init success, use current surface and refer frame to generate frame
     sl::uint2  dimensions = sl::uint2(ctx.swapChainWidth, ctx.swapChainHeight);
     float tipDistance = static_cast<float>(seq + 1) / static_cast<float>(tot + 1);
@@ -985,7 +1027,7 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
     uint32_t grid[] = { (ctx.swapChainWidth + 8 - 1) / 8, (ctx.swapChainHeight + 8 - 1) / 8, 1 };
     // MTFKClearing
     {
-        sl::phsrg::ClearingConstParamStruct lb;
+        sl::mtssg::ClearingConstParamStruct lb;
         lb.dimensions = dimensions;
         lb.tipTopDistance = tipTopDistance;
         lb.viewportSize = viewportSize;
@@ -994,12 +1036,23 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
         processFrameGenerationClearing(&lb, grid);
     }
 
-    addPushPullPasses(ctx.currMvec, ctx.currMvecFiltered, ctx, 3);
-    addPushPullPasses(ctx.prevMvec, ctx.prevMvecFiltered, ctx, 3);
+    // MTFKNormalizing
+    {
+        sl::mtssg::NormalizingConstParamStruct nb;
+        nb.dimensions = dimensions;
+        nb.tipTopDistance = tipTopDistance;
+        nb.viewportSize = viewportSize;
+        nb.viewportInv = viewportInv;
+
+        processFrameGenerationNormalizing(&nb, grid);
+    }
+
+    addPushPullPasses(ctx.currMvecDuplicated, ctx.currMvecFiltered, ctx, 3);
+    addPushPullPasses(ctx.prevMvecDuplicated, ctx.prevMvecFiltered, ctx, 3);
 
     // MTFKReprojection
     {
-        sl::phsrg::MVecParamStruct cb;
+        sl::mtssg::MVecParamStruct cb;
         memcpy(&cb.prevClipToClip, &ctx.commonConsts->prevClipToClip, sizeof(float) * 16);
         memcpy(&cb.clipToPrevClip, &ctx.commonConsts->clipToPrevClip, sizeof(float) * 16);
         cb.dimensions = dimensions;
@@ -1012,7 +1065,7 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
 
     // MTFKMerging
     {
-        sl::phsrg::MergeParamStruct mb;
+        sl::mtssg::MergeParamStruct mb;
         memcpy(&mb.prevClipToClip, &ctx.commonConsts->prevClipToClip, sizeof(float) * 16);
         memcpy(&mb.clipToPrevClip, &ctx.commonConsts->clipToPrevClip, sizeof(float) * 16);
         mb.dimensions = dimensions;
@@ -1029,20 +1082,20 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
 
     // MTFKResolution
     {
-        sl::phsrg::ResolutionConstParamStruct rb;
+        sl::mtssg::ResolutionConstParamStruct rb;
         rb.dimensions = dimensions;
         rb.tipTopDistance = tipTopDistance;
         rb.viewportSize = viewportSize;
         rb.viewportInv = viewportInv;
         processFrameGenerationResolution(&rb, grid);
     }
-    phsrFG_END_PERF(onlyCheckKernelPerf, "sl.phsr-fg.kernel");
+    MTSSFG_END_PERF(onlyCheckKernelPerf, "sl.mtss-fg.kernel");
 
-#if phsrFG_IMGUI
-    bool showDebugOverLay = (ctx.options.flags & phsrGFlags::eShowDebugOverlay) != 0;
+#if MTSSFG_IMGUI
+    bool showDebugOverLay = (ctx.options.flags & MTSSGFlags::eShowDebugOverlay) != 0;
     if (showDebugOverLay)
     {
-        sl::phsrFgDebugOverlayInfo info{};
+        sl::MtssFgDebugOverlayInfo info{};
         info.pRenderTarget = ctx.generatedFrame;
         info.pPrevDepth = ctx.prevDepth;
         info.pCurrDepth = ctx.currDepth;
@@ -1051,7 +1104,7 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
         info.pPrevMotionVector = ctx.prevMvec;
         info.pCurrMotionVector = ctx.currMvec;
         info.pUiColor = ctx.uiColor;
-        ctx.pDebugOverlay->DrawphsrFG(info);
+        ctx.pDebugOverlay->DrawMtssFG(info);
     }
 #endif
 
@@ -1059,7 +1112,7 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
     auto status = ctx.pCompute->copyResource(ctx.pCmdList->getCmdList(), ctx.appSurface, ctx.generatedFrame);
     assert(status == sl::chi::ComputeStatus::eOk);
 
-    if (api == sl::phsrg::PresentApi::Present)
+    if (api == sl::mtssg::PresentApi::Present)
     {
         swapChain->Present(SyncInterval, Flags);
     }
@@ -1069,7 +1122,7 @@ void interpolateCommon(bool onlyCheckKernelPerf, IDXGISwapChain* swapChain, UINT
     }
 
     ctx.state.numFramesActuallyPresented++;
-    ctx.state.status = phsrGStatus::eOk;
+    ctx.state.status = MTSSGStatus::eOk;
 }
 
 void presentCommon(IDXGISwapChain*                swapChain,
@@ -1077,9 +1130,9 @@ void presentCommon(IDXGISwapChain*                swapChain,
                    UINT                           Flags,
                    const DXGI_PRESENT_PARAMETERS* pPresentParameters,
                    bool                           firstFrame,
-                   sl::phsrg::PresentApi          api)
+                   sl::mtssg::PresentApi          api)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     common::EventData eventData;
     eventData.id        = 0;
@@ -1088,18 +1141,18 @@ void presentCommon(IDXGISwapChain*                swapChain,
     bool foundConstData = getDataResult == common::GetDataResult::eFound;
     if (foundConstData == false && IsContextStatusOk())
     {
-        SL_LOG_ERROR("Const Data Not Found, phsr-FG Will Do Nothing!");
-        ctx.state.status = phsrGStatus::eFailCommonConstantsInvalid;
+        SL_LOG_ERROR("Const Data Not Found, MTSS-FG Will Do Nothing!");
+        ctx.state.status = MTSSGStatus::eFailCommonConstantsInvalid;
     }
     else
     {
-        ctx.state.status = phsrGStatus::eOk;
+        ctx.state.status = MTSSGStatus::eOk;
     }
 
     bool onlyCheckKernelPerf       = (ctx.frameId % 2) == 1;
     bool onlyCheckPresentTotalPerf = onlyCheckKernelPerf == false;
 
-    phsrFG_BEGIN_PERF(onlyCheckPresentTotalPerf, "sl.phsr-fg.present");
+    MTSSFG_BEGIN_PERF(onlyCheckPresentTotalPerf, "sl.mtss-fg.present");
 
     bool taggedResourceUpdate = checkTagedResourceUpdate(ctx.viewportId);
     acquireTaggedResource(ctx.viewportId);
@@ -1115,7 +1168,7 @@ void presentCommon(IDXGISwapChain*                swapChain,
 
     if (firstFrame || foundConstData == false || taggedResourceUpdate == true || IsContextStatusOk() == false)
     {
-        if (api == sl::phsrg::PresentApi::Present)
+        if (api == sl::mtssg::PresentApi::Present)
         {
             swapChain->Present(SyncInterval, Flags);
         }
@@ -1141,10 +1194,10 @@ void presentCommon(IDXGISwapChain*                swapChain,
         status = ctx.pCompute->copyResource(ctx.pCmdList->getCmdList(), ctx.appSurface, ctx.appSurfaceBackup);
         assert(status == sl::chi::ComputeStatus::eOk);
 
-        bool showRenderFrame = ((ctx.options.flags & phsrGFlags::eShowOnlyInterpolatedFrame) == 0);
+        bool showRenderFrame = ((ctx.options.flags & MTSSGFlags::eShowOnlyInterpolatedFrame) == 0);
         if (showRenderFrame)
         {
-            if (api == sl::phsrg::PresentApi::Present)
+            if (api == sl::mtssg::PresentApi::Present)
             {
                 swapChain->Present(SyncInterval, Flags);
             }
@@ -1160,9 +1213,9 @@ void presentCommon(IDXGISwapChain*                swapChain,
     CHI_VALIDATE(ctx.pCompute->copyResource(ctx.pCmdList->getCmdList(), ctx.prevHudLessColor, ctx.currHudLessColor));
     CHI_VALIDATE(ctx.pCompute->copyResource(ctx.pCmdList->getCmdList(), ctx.prevMvec, ctx.currMvec));
 
-    phsrFG_END_PERF(onlyCheckPresentTotalPerf, "sl.phsr-fg.present");
+    MTSSFG_END_PERF(onlyCheckPresentTotalPerf, "sl.mtss-fg.present");
 }
-} // namespace phsrg
+} // namespace mtssg
 
 void updateEmbeddedJSON(json& config)
 {
@@ -1195,18 +1248,25 @@ void updateEmbeddedJSON(json& config)
 
 void slOnPluginShutdown()
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
-    phsrg::destroyFrameGenerationResource();
+    mtssg::destroyFrameGenerationResource();
 
     CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.clearKernel));
     CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.reprojectionKernel));
-    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.resolutionKernel));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.resolutionKernel))
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.normalizeKernel));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.mergeKernelHalf));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.mergeKernelFull));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.pushKernel));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.pullKernel));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.firstlegKernel));
+    CHI_VALIDATE(ctx.pCompute->destroyKernel(ctx.laststretchKernel));
 
     ctx.pCompute->destroyCommandListContext(ctx.pCmdList);
     ctx.pCompute->destroyCommandQueue(ctx.cmdCopyQueue);
 
-#if phsrFG_IMGUI
+#if MTSSFG_IMGUI
     delete ctx.pDebugOverlay;
 #endif
 
@@ -1217,9 +1277,9 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 {
     SL_PLUGIN_COMMON_STARTUP();
 
-    auto& ctx                  = (*phsrg::getContext());
+    auto& ctx                  = (*mtssg::getContext());
     ctx.state.minWidthOrHeight = 128;
-    ctx.state.status           = phsrGStatus::eOk;
+    ctx.state.status           = MTSSGStatus::eOk;
 
     auto parameters = api::getContext()->parameters;
 
@@ -1232,7 +1292,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     ctx.platform = (RenderAPI)deviceType;
     if (ctx.platform != RenderAPI::eD3D11)
     {
-        SL_LOG_ERROR("phsr-FG Only Support D3D11 Device Now!");
+        SL_LOG_ERROR("MTSS-FG Only Support D3D11 Device Now!");
         return false;
     }
 
@@ -1241,55 +1301,60 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
         return false;
     }
 
-    ctx.pCompute->createCommandQueue(chi::CommandQueueType::eCopy, ctx.cmdCopyQueue, "phsr-g copy queue");
+    ctx.pCompute->createCommandQueue(chi::CommandQueueType::eCopy, ctx.cmdCopyQueue, "mtss-g copy queue");
     assert(ctx.cmdCopyQueue != nullptr);
 
-    ctx.pCompute->createCommandListContext(ctx.cmdCopyQueue, 1, ctx.pCmdList, "phsr-g ctx");
+    ctx.pCompute->createCommandListContext(ctx.cmdCopyQueue, 1, ctx.pCmdList, "mtss-g ctx");
     assert(ctx.pCmdList != nullptr);
 
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_clearing_cs,
-                                            phsr_fg_clearing_cs_len,
-                                            "phsr_fg_clearing.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_clearing_cs,
+                                            mtss_fg_clearing_cs_len,
+                                            "mtss_fg_clearing.cs",
                                             "main",
                                             ctx.clearKernel));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_reprojection_cs,
-                                            phsr_fg_reprojection_cs_len,
-                                            "phsr_fg_reprojection.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_normalizing_cs,
+                                            mtss_fg_normalizing_cs_len,
+                                            "mtss_fg_normalizing.cs",
+                                            "main",
+                                            ctx.normalizeKernel));
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_reprojection_cs,
+                                            mtss_fg_reprojection_cs_len,
+                                            "mtss_fg_reprojection.cs",
                                             "main",
                                             ctx.reprojectionKernel));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_merginghalf_cs,
-                                            phsr_fg_merginghalf_cs_len,
-                                            "phsr_fg_merginghalf.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_merginghalf_cs,
+                                            mtss_fg_merginghalf_cs_len,
+                                            "mtss_fg_merginghalf.cs",
                                             "main",
                                             ctx.mergeKernelHalf));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_mergingfull_cs,
-                                            phsr_fg_mergingfull_cs_len,
-                                            "phsr_fg_mergingfull.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_mergingfull_cs,
+                                            mtss_fg_mergingfull_cs_len,
+                                            "mtss_fg_mergingfull.cs",
                                             "main",
                                             ctx.mergeKernelFull));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_firstleg_cs,
-                                            phsr_fg_firstleg_cs_len,
-                                            "phsr_fg_firstleg.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_firstleg_cs,
+                                            mtss_fg_firstleg_cs_len,
+                                            "mtss_fg_firstleg.cs",
                                             "main",
                                             ctx.firstlegKernel));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_pulling_cs,
-                                            phsr_fg_pulling_cs_len,
-                                            "phsr_fg_pulling.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_pulling_cs,
+                                            mtss_fg_pulling_cs_len,
+                                            "mtss_fg_pulling.cs",
                                             "main",
                                             ctx.pullKernel));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_laststretch_cs,
-                                            phsr_fg_laststretch_cs_len,
-                                            "phsr_fg_laststretch.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_laststretch_cs,
+                                            mtss_fg_laststretch_cs_len,
+                                            "mtss_fg_laststretch.cs",
                                             "main",
                                             ctx.laststretchKernel));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_pushing_cs,
-                                            phsr_fg_pushing_cs_len,
-                                            "phsr_fg_pushing.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_pushing_cs,
+                                            mtss_fg_pushing_cs_len,
+                                            "mtss_fg_pushing.cs",
                                             "main",
                                             ctx.pushKernel));
-    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)phsr_fg_resolution_cs,
-                                            phsr_fg_resolution_cs_len,
-                                            "phsr_fg_resolution.cs",
+    CHI_CHECK_RF(ctx.pCompute->createKernel((void*)mtss_fg_resolution_cs,
+                                            mtss_fg_resolution_cs_len,
+                                            "mtss_fg_resolution.cs",
                                             "main",
                                             ctx.resolutionKernel));
 
@@ -1298,7 +1363,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     getTaggedResource(kBufferTypeDepth, temp, 0);
     getTaggedResource(kBufferTypeMotionVectors, temp, 0);
 
-#if phsrFG_IMGUI
+#if MTSSFG_IMGUI
     sl::imgui::ImGUI* pImGui = nullptr;
     param::getPointerParam(parameters, param::imgui::kInterface, &pImGui);
     ctx.pDebugOverlay = new sl::ImGuiDebugOverlay(pImGui, ctx.pCompute, device, ctx.platform);
@@ -1309,7 +1374,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 
 sl::Result slSetConstants(const Constants& values, const FrameToken& frame, const ViewportHandle& viewport)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     if (ctx.viewportId != viewport)
     {
@@ -1337,12 +1402,12 @@ HRESULT slHookCreateSwapChain(IDXGIFactory*         pFactory,
 
     HRESULT result = S_OK;
 
-#if phsrFG_IMGUI
-    auto& ctx        = (*phsrg::getContext());
+#if MTSSFG_IMGUI
+    auto& ctx        = (*mtssg::getContext());
     ctx.pDebugOverlay->SetWindow(pDesc->OutputWindow);
 #endif
 
-    phsrg::createGeneratedFrame(pDesc->BufferDesc.Width, pDesc->BufferDesc.Height, pDesc->BufferDesc.Format);
+    mtssg::createGeneratedFrame(pDesc->BufferDesc.Width, pDesc->BufferDesc.Height, pDesc->BufferDesc.Format);
 
     return result;
 }
@@ -1360,12 +1425,12 @@ HRESULT slHookCreateSwapChainForHwnd(IDXGIFactory2*                         pFac
 
     HRESULT result = S_OK;
 
-#if phsrFG_IMGUI
-    auto& ctx        = (*phsrg::getContext());
+#if MTSSFG_IMGUI
+    auto& ctx        = (*mtssg::getContext());
     ctx.pDebugOverlay->SetWindow(hWnd);
 #endif
 
-    phsrg::createGeneratedFrame(pDesc->Width, pDesc->Height, pDesc->Format);
+    mtssg::createGeneratedFrame(pDesc->Width, pDesc->Height, pDesc->Format);
 
     return result;
 }
@@ -1378,25 +1443,25 @@ HRESULT slHookCreateSwapChainForCoreWindow(IDXGIFactory2*               pFactory
                                            IDXGISwapChain1**            ppSwapChain,
                                            bool&                        Skip)
 {
-    phsrFG_NOT_TEST();
+    MTSSFG_NOT_TEST();
     SL_LOG_INFO("slHookCreateSwapChainForCoreWindow");
 
     HRESULT result = S_OK;
 
-    auto& ctx        = (*phsrg::getContext());
+    auto& ctx        = (*mtssg::getContext());
 
-    phsrg::createGeneratedFrame(pDesc->Width, pDesc->Height, pDesc->Format);
+    mtssg::createGeneratedFrame(pDesc->Width, pDesc->Height, pDesc->Format);
 
     return result;
 }
 
 HRESULT slHookPresent(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, bool& Skip)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
-    if (ctx.options.mode == phsrGMode::eOff)
+    if (ctx.options.mode == MTSSGMode::eOff)
     {
-        SL_LOG_INFO("phsr-G Mode is Off, present return directly.");
+        SL_LOG_INFO("MTSS-G Mode is Off, present return directly.");
         Skip = false;
     }
     else
@@ -1406,11 +1471,11 @@ HRESULT slHookPresent(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, 
         if (ctx.appSurface == nullptr)
         {
             ctx.pCompute->getSwapChainBuffer(swapChain, 0, ctx.appSurface);
-            phsrg::cloneResource(ctx.appSurface, ctx.appSurfaceBackup, "app surface backup");
+            mtssg::cloneResource(ctx.appSurface, ctx.appSurfaceBackup, "app surface backup");
             firstFrame = true;
         }
 
-        presentCommon(swapChain, SyncInterval, Flags, nullptr, firstFrame, sl::phsrg::PresentApi::Present);
+        presentCommon(swapChain, SyncInterval, Flags, nullptr, firstFrame, sl::mtssg::PresentApi::Present);
     }
 
     return S_OK;
@@ -1422,15 +1487,15 @@ HRESULT slHookPresent1(IDXGISwapChain*                SwapChain,
                        const DXGI_PRESENT_PARAMETERS* pPresentParameters,
                        bool&                          Skip)
 {
-    phsrFG_NOT_TEST();
+    MTSSFG_NOT_TEST();
     SL_LOG_INFO("slHookPresent1");
 
     HRESULT result = S_OK;
 
-    auto& ctx = (*phsrg::getContext());
-    if (ctx.options.mode == phsrGMode::eOff)
+    auto& ctx = (*mtssg::getContext());
+    if (ctx.options.mode == MTSSGMode::eOff)
     {
-        SL_LOG_INFO("phsr-G Mode is Off, present return directly.");
+        SL_LOG_INFO("MTSS-G Mode is Off, present return directly.");
         Skip = false;
     }
     else
@@ -1440,7 +1505,7 @@ HRESULT slHookPresent1(IDXGISwapChain*                SwapChain,
         if (ctx.appSurface == nullptr)
         {
             ctx.pCompute->getSwapChainBuffer(SwapChain, 0, ctx.appSurface);
-            phsrg::cloneResource(ctx.appSurface, ctx.appSurfaceBackup, "app surface backup");
+            mtssg::cloneResource(ctx.appSurface, ctx.appSurfaceBackup, "app surface backup");
             firstFrame = true;
         }
 
@@ -1449,7 +1514,7 @@ HRESULT slHookPresent1(IDXGISwapChain*                SwapChain,
                       PresentFlags,
                       pPresentParameters,
                       firstFrame,
-                      sl::phsrg::PresentApi::Present1);
+                      sl::mtssg::PresentApi::Present1);
     }
 
     return result;
@@ -1467,7 +1532,7 @@ HRESULT slHookResizeBuffersPre(IDXGISwapChain* SwapChain,
 
     HRESULT result = S_OK;
 
-    phsrg::createGeneratedFrame(Width, Height, NewFormat);
+    mtssg::createGeneratedFrame(Width, Height, NewFormat);
 
     return result;
 }
@@ -1496,9 +1561,9 @@ HRESULT slHookSetFullscreenStatePre(IDXGISwapChain* SwapChain, BOOL pFullscreen,
     return result;
 }
 
-sl::Result slphsrGGetState(const sl::ViewportHandle& viewport, sl::phsrGState& state, const sl::phsrGOptions* options)
+sl::Result slMTSSGGetState(const sl::ViewportHandle& viewport, sl::MTSSGState& state, const sl::MTSSGOptions* options)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     state                                = ctx.state;
     ctx.state.numFramesActuallyPresented = 0;
@@ -1506,22 +1571,22 @@ sl::Result slphsrGGetState(const sl::ViewportHandle& viewport, sl::phsrGState& s
     return sl::Result::eOk;
 }
 
-sl::Result slphsrGSetOptions(const sl::ViewportHandle& viewport, const sl::phsrGOptions& options)
+sl::Result slMTSSGSetOptions(const sl::ViewportHandle& viewport, const sl::MTSSGOptions& options)
 {
-    auto& ctx = (*phsrg::getContext());
+    auto& ctx = (*mtssg::getContext());
 
     ctx.options = options;
 
-#if phsrFG_DPF
-    SL_LOG_INFO("phsr-G Option Mode:               %s ", ctx.options.mode == sl::phsrGMode::eOn ? "On" : "Off");
-    SL_LOG_INFO("phsr-G Option NumBackBuffers:     %d ", ctx.options.numBackBuffers);
-    SL_LOG_INFO("phsr-G Option FrameBuffer Witdh:  %d ", ctx.options.colorWidth);
-    SL_LOG_INFO("phsr-G Option FrameBuffer Height: %d ", ctx.options.colorHeight);
-    SL_LOG_INFO("phsr-G Option FrameBuffer Format: %d ", ctx.options.colorBufferFormat);
-    SL_LOG_INFO("phsr-G Option DepthBuffer Format: %d ", ctx.options.depthBufferFormat);
-    SL_LOG_INFO("phsr-G Option numFramesToGenerate:%d ", ctx.options.numFramesToGenerate);
-    SL_LOG_INFO("phsr-G Option Mvec Depth Witdh:   %d ", ctx.options.mvecDepthWidth);
-    SL_LOG_INFO("phsr-G Option Mvec Depth Height:  %d ", ctx.options.mvecDepthHeight);
+#if MTSSFG_DPF
+    SL_LOG_INFO("MTSS-G Option Mode:               %s ", ctx.options.mode == sl::MTSSGMode::eOn ? "On" : "Off");
+    SL_LOG_INFO("MTSS-G Option NumBackBuffers:     %d ", ctx.options.numBackBuffers);
+    SL_LOG_INFO("MTSS-G Option FrameBuffer Witdh:  %d ", ctx.options.colorWidth);
+    SL_LOG_INFO("MTSS-G Option FrameBuffer Height: %d ", ctx.options.colorHeight);
+    SL_LOG_INFO("MTSS-G Option FrameBuffer Format: %d ", ctx.options.colorBufferFormat);
+    SL_LOG_INFO("MTSS-G Option DepthBuffer Format: %d ", ctx.options.depthBufferFormat);
+    SL_LOG_INFO("MTSS-G Option numFramesToGenerate:%d ", ctx.options.numFramesToGenerate);
+    SL_LOG_INFO("MTSS-G Option Mvec Depth Witdh:   %d ", ctx.options.mvecDepthWidth);
+    SL_LOG_INFO("MTSS-G Option Mvec Depth Height:  %d ", ctx.options.mvecDepthHeight);
 #endif
 
     return sl::Result::eOk;
@@ -1547,8 +1612,8 @@ SL_EXPORT void* slGetPluginFunction(const char* functionName)
     SL_EXPORT_FUNCTION(slHookResizeBuffers1Pre);
     SL_EXPORT_FUNCTION(slHookSetFullscreenStatePre);
 
-    SL_EXPORT_FUNCTION(slphsrGGetState);
-    SL_EXPORT_FUNCTION(slphsrGSetOptions);
+    SL_EXPORT_FUNCTION(slMTSSGGetState);
+    SL_EXPORT_FUNCTION(slMTSSGSetOptions);
 
     return nullptr;
 }

@@ -77,12 +77,12 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
     sampleUVTip = clamp(sampleUVTip, float2(0.0f, 0.0f), float2(1.0f, 1.0f));
     float2 sampleUVTop = topTracedScreenPos;
     sampleUVTop = clamp(sampleUVTop, float2(0.0f, 0.0f), float2(1.0f, 1.0f));
-	
+    
     float3 tipSample = colorTextureTip.SampleLevel(bilinearClampedSampler, sampleUVTip, 0);
     float tipDepth = depthTextureTip.SampleLevel(bilinearClampedSampler, sampleUVTip, 0);
     float3 topSample = colorTextureTop.SampleLevel(bilinearClampedSampler, sampleUVTop, 0);
     float topDepth = depthTextureTop.SampleLevel(bilinearClampedSampler, sampleUVTop, 0);
-	
+    
     float3 finalSample = float3(0.0f, 0.0f, 0.0f);
     if (isTopVisible)
     {
@@ -110,7 +110,7 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
     }
     else
     {
-        float2 velocityAdvection = currMotionUnprojected[currentPixelIndex] * viewportInv;
+        float2 velocityAdvection = currMotionUnprojected[currentPixelIndex];
 
         float2 advTipTranslation = distanceTip * velocityHalfTip;
         float2 advTopTranslation = distanceTop * velocityAdvection;
@@ -135,9 +135,9 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
         finalSample = debugCyan;
 #endif
     }
-	
-	{
-        bool bIsValidhistoryPixel = all(uint2(currentPixelIndex) < viewportSize);
+    
+    {
+        bool bIsValidhistoryPixel = all(uint2(currentPixelIndex) < dimensions);
         if (bIsValidhistoryPixel)
         {
             float4 uiColorBlendingIn = uiColorTexture[currentPixelIndex];

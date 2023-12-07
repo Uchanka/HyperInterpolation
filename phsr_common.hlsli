@@ -1,4 +1,3 @@
-// Copyright (c) 2023 Moore Threads Technology Co. Ltd. All rights reserved.
 #pragma warning(error: 3206)
 
 #define mtss_float half
@@ -60,11 +59,11 @@ uint compressDepth(float incomingDepth)
 {
     float incomingAs32F = float(incomingDepth);
     uint incoming32Uint = asuint(incomingAs32F);
-	
+    
     int sig32 = (incoming32Uint >> 31) & 0x1;
     int exp32 = (incoming32Uint >> 23) & 0xFF;
     int man32 = incoming32Uint & 0x7FFFFF;
-	
+    
     int sig19 = sig32; //Not gonna use it
     int exp19 = exp32 - 127 + ((1 << (expCustomized - 1)) - 1);
     int man19 = man32 >> (23 - manCustomized);
@@ -79,12 +78,12 @@ uint compressDepth(float incomingDepth)
         }
         exp19 = 0;
     }
-	
+    
     uint returning19Uint = 0;
-	//returning16Uint |= (sig16 << 15);
+    //returning16Uint |= (sig16 << 15);
     returning19Uint |= (exp19 << manCustomized);
     returning19Uint |= man19;
-	
+    
     return (returning19Uint << (32 - (expCustomized + manCustomized))) & DepthFirst19DigitsMask;
 }
 
@@ -125,7 +124,7 @@ mtss_float Luma4(mtss_float3 Color)
 
 mtss_float HdrWeightY(mtss_float Color)
 {
-	mtss_float Exposure = mtss_float(1.0);
+    mtss_float Exposure = mtss_float(1.0);
 
     return max(mtss_float(HDR_WEIGHT_SAFE_MIN_VALUE), rcp(Color * Exposure + mtss_float(4.0)));
 }
@@ -180,34 +179,34 @@ static const int subsampleCount9PointPatch = 9;
 static const int2 subsamplePixelOffset4PointTian[FOUR_POINTS_TIAN_SIZE] =
 {
     int2(0, 0), //K
-	
-	int2(0, 1),
-	int2(1, 0),
-	int2(1, 1)
+    
+    int2(0, 1),
+    int2(1, 0),
+    int2(1, 1)
 };
 
 static const int2 subsamplePixelOffset5PointStencil[5] =
 {
     int2(0, 0), // K
-	
-	int2(0, -1),
-	int2(-1, 0),
-	int2(1, 0),
-	int2(0, 1)
+    
+    int2(0, -1),
+    int2(-1, 0),
+    int2(1, 0),
+    int2(0, 1)
 };
 
 static const int2 subsamplePixelOffset9PointPatch[THREE_BY_THREE_PATCH_SIZE] =
 {
     int2(0, 0), // K
-	
-	int2(-1, -1),
-	int2(0, -1),
-	int2(1, -1),
-	int2(-1, 0),
-	int2(1, 0),
-	int2(-1, 1),
-	int2(0, 1),
-	int2(1, 1)
+    
+    int2(-1, -1),
+    int2(0, -1),
+    int2(1, -1),
+    int2(-1, 0),
+    int2(1, 0),
+    int2(-1, 1),
+    int2(0, 1),
+    int2(1, 1)
 };
 
 mtss_float gaussianDistributionWeightForVariance(float2 offset, float patchSize)
@@ -230,8 +229,8 @@ mtss_float LanzcosEachDim(mtss_float diff)
     }
     else
     {
-		mtss_float nominator = lanzcosWidth * sin(lanzcosPie * diff) * sin(lanzcosPie * diff / lanzcosWidth);
-		mtss_float denominator = lanzcosPie * lanzcosPie * diff * diff;
+        mtss_float nominator = lanzcosWidth * sin(lanzcosPie * diff) * sin(lanzcosPie * diff / lanzcosWidth);
+        mtss_float denominator = lanzcosPie * lanzcosPie * diff * diff;
         return nominator * SafeRcp(denominator);
     }
 }
@@ -239,36 +238,36 @@ mtss_float LanzcosEachDim(mtss_float diff)
 mtss_float UpsampleLanzcos(mtss_float2 diff, mtss_float upsampleFactor)
 {
     diff *= (upsampleFactor);
-	mtss_float contributionX = LanzcosEachDim(diff.x);
-	mtss_float contributionY = LanzcosEachDim(diff.y);
+    mtss_float contributionX = LanzcosEachDim(diff.x);
+    mtss_float contributionY = LanzcosEachDim(diff.y);
     return contributionX * contributionY;
 }
 
 mtss_float UpsampleFilterGaussian(mtss_float2 diff, mtss_float upsampleFactor)
 {
-	mtss_float u2 = upsampleFactor * upsampleFactor;
-	// 1 - 1.9 * x^2 + 0.9 * x^4
-	mtss_float x2 = saturate(u2 * dot(diff, diff));
+    mtss_float u2 = upsampleFactor * upsampleFactor;
+    // 1 - 1.9 * x^2 + 0.9 * x^4
+    mtss_float x2 = saturate(u2 * dot(diff, diff));
     return mtss_float(((mtss_float(0.9f)) * x2 - mtss_float(1.9f)) * x2 + mtss_float(1.0f));
 }
 
 mtss_float GetUpsampleKernelWeight(mtss_float2 diff, mtss_float upsampleFactor, mtss_float minimalContribution)
 {
-	//mtss_float kernelWeight = UpsampleBicubic(diff, upsampleFactor);
-	mtss_float kernelWeight = UpsampleLanzcos(diff, upsampleFactor);
-	//mtss_float kernelWeight = UpsampleFilterTent(diff, 2.0f * SafeRcp(upsampleFactor));
-	//mtss_float kernelWeight = UpsampleFilterGaussian(diff, upsampleFactor);
-	//mtss_float kernelWeight = UpsampleFilterUniversal(diff, SafeRcp(upsampleFactor));
+    //mtss_float kernelWeight = UpsampleBicubic(diff, upsampleFactor);
+    mtss_float kernelWeight = UpsampleLanzcos(diff, upsampleFactor);
+    //mtss_float kernelWeight = UpsampleFilterTent(diff, 2.0f * SafeRcp(upsampleFactor));
+    //mtss_float kernelWeight = UpsampleFilterGaussian(diff, upsampleFactor);
+    //mtss_float kernelWeight = UpsampleFilterUniversal(diff, SafeRcp(upsampleFactor));
     return max(kernelWeight, minimalContribution);
 }
 
 mtss_float GetBlunterKernelWeight(mtss_float2 diff, mtss_float upsampleFactor, mtss_float minimalContribution)
 {
-	//mtss_float kernelWeight = UpsampleBicubic(diff, 1.0f);
-	mtss_float kernelWeight = UpsampleFilterGaussian(diff, 0.45f);
-	//mtss_float kernelWeight = UpsampleFilterTent(diff, 2.0f * SafeRcp(upsampleFactor));
-	//mtss_float kernelWeight = UpsampleFilterGaussian(diff, upsampleFactor);
-	//mtss_float kernelWeight = UpsampleFilterUniversal(diff, SafeRcp(upsampleFactor));
+    //mtss_float kernelWeight = UpsampleBicubic(diff, 1.0f);
+    mtss_float kernelWeight = UpsampleFilterGaussian(diff, 0.45f);
+    //mtss_float kernelWeight = UpsampleFilterTent(diff, 2.0f * SafeRcp(upsampleFactor));
+    //mtss_float kernelWeight = UpsampleFilterGaussian(diff, upsampleFactor);
+    //mtss_float kernelWeight = UpsampleFilterUniversal(diff, SafeRcp(upsampleFactor));
     return max(kernelWeight, minimalContribution);
 }
 
@@ -346,7 +345,7 @@ float3 Tonemap(float3 c)
 #ifdef TONEMAPPING_ENABLED
     return c * rcp(c + 1.0f);
 #else
-	return c;
+    return c;
 #endif
 }
 
@@ -357,8 +356,8 @@ float3 TonemapWithWeight(float3 c, float w)
 #ifdef TONEMAPPING_ENABLED
     return c * (w * rcp(c + 1.0f));
 #else
-	return c * w;
-#endif	
+    return c * w;
+#endif  
 }
 
 // Apply this to restore the linear HDR color before writing out the result of the resolve.
@@ -367,7 +366,7 @@ float3 TonemapInvert(float3 c)
 #ifdef TONEMAPPING_ENABLED
     return c * SafeRcp3Ret1(1.0f - c);
 #else
-	return c;
+    return c;
 #endif
 }
 
