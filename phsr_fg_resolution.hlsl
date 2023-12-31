@@ -52,18 +52,22 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
 
     bool isFullWritten = all(abs(velocityFull) < viewportInv) ? false : true;
     bool isHalfTipWritten = all(abs(velocityHalfTip) < viewportInv) ? false : true;
+    bool isHalfTopWritten = all(abs(velocityHalfTop) < viewportInv) ? false : true;
 
     bool isTopInvisible = any(velocityHalfTop >= ImpossibleMotionValue) ? true : false;
     bool isTopVisible = !isTopInvisible;
-
     if (isTopInvisible)
     {
         velocityHalfTop -= float2(ImpossibleMotionOffset, ImpossibleMotionOffset);
     }
 
-    bool isTipInvisible = (!isHalfTipWritten && isFullWritten) ? true : false;
+    bool isTipInvisible = any(velocityHalfTip >= ImpossibleMotionValue) ? true : false;
     bool isTipVisible = !isTipInvisible;
-
+    if (isTipInvisible)
+    {
+        velocityHalfTip -= float2(ImpossibleMotionOffset, ImpossibleMotionOffset);
+    }
+	
     const float distanceTip = tipTopDistance.x;
     const float distanceTop = tipTopDistance.y;
 
@@ -77,12 +81,12 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
     sampleUVTip = clamp(sampleUVTip, float2(0.0f, 0.0f), float2(1.0f, 1.0f));
     float2 sampleUVTop = topTracedScreenPos;
     sampleUVTop = clamp(sampleUVTop, float2(0.0f, 0.0f), float2(1.0f, 1.0f));
-    
+	
     float3 tipSample = colorTextureTip.SampleLevel(bilinearClampedSampler, sampleUVTip, 0);
     float tipDepth = depthTextureTip.SampleLevel(bilinearClampedSampler, sampleUVTip, 0);
     float3 topSample = colorTextureTop.SampleLevel(bilinearClampedSampler, sampleUVTop, 0);
     float topDepth = depthTextureTop.SampleLevel(bilinearClampedSampler, sampleUVTop, 0);
-    
+	
     float3 finalSample = float3(0.0f, 0.0f, 0.0f);
     if (isTopVisible)
     {
@@ -91,19 +95,16 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
         finalSample = debugRed;
 #endif
     }
-    else if (isFullWritten)
+    /*else if (isTopVisible)
     {
-        finalSample = tipSample;
+        finalSample = topSample;
 #ifdef DEBUG_COLORS
         finalSample = debugBlue;
 #endif
-    }
-    else if (isHalfTipWritten)
+    }*/
+    else if (isTipVisible)
     {
-        float2 halfScreenPos = screenPos + distanceTip * velocityHalfTip;
-        float2 halfUVTip = halfScreenPos;
-        
-        finalSample = colorTextureTip.SampleLevel(bilinearClampedSampler, halfUVTip, 0);
+        finalSample = tipSample;
 #ifdef DEBUG_COLORS
         finalSample = debugGreen;
 #endif
@@ -136,7 +137,7 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
 #endif
     }
     
-    {
+	{
         bool bIsValidhistoryPixel = all(uint2(currentPixelIndex) < dimensions);
         if (bIsValidhistoryPixel)
         {

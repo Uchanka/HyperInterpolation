@@ -34,17 +34,18 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
 {
     uint2 dispatchThreadId = localId + groupId * uint2(TILE_SIZE, TILE_SIZE);
     int2 currentPixelIndex = dispatchThreadId;
-    
+	
     float2 pixelCenter = float2(currentPixelIndex) + 0.5f;
     float2 viewportUV = pixelCenter * viewportInv;
     float2 screenPos = viewportUV;
     float2 mCurr = currMotionVector.SampleLevel(bilinearClampedSampler, viewportUV, 0);
     float2 mPrev = prevMotionVector.SampleLevel(bilinearClampedSampler, viewportUV, 0);
+    //float2 mPrev = -ComputeStaticVelocityTopTip(screenPos, depthTextureTip.SampleLevel(bilinearClampedSampler, viewportUV, 0).r, prevClipToClip);
 
     const float distanceFull = tipTopDistance.x + tipTopDistance.y;
     const float distanceHalfTip = tipTopDistance.x;
     const float distanceHalfTop = tipTopDistance.y;
-    
+	
     //Tip extrapolation --> ->
     float2 halfTipTranslation = mPrev * distanceHalfTip;
     float2 halfTipTracedScreenPos = screenPos - halfTipTranslation;
@@ -61,7 +62,7 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
     float2 halfTopTranslation = mCurr * distanceHalfTop;
     float2 halfTopTracedScreenPos = screenPos + halfTopTranslation;
     int2 halfTopTracedIndex = floor(halfTopTracedScreenPos * viewportSize);
-    float2 halfTopTracedFloatCenter = float2(halfTopTracedIndex) + float2(0.5f, 0.5f);  
+    float2 halfTopTracedFloatCenter = float2(halfTopTracedIndex) + float2(0.5f, 0.5f);	
     float2 halfTopTracedPos = halfTopTracedFloatCenter * viewportInv;
     float2 samplePosHalfTop = halfTopTracedPos - halfTopTranslation;
     float2 sampleUVHalfTop = samplePosHalfTop;
@@ -80,15 +81,15 @@ void main(uint2 groupId : SV_GroupID, uint2 localId : SV_GroupThreadID, uint gro
     sampleUVFull = clamp(sampleUVFull, float2(0.0f, 0.0f), float2(1.0f, 1.0f));
     float fullDepth = depthTextureTop.SampleLevel(bilinearClampedSampler, sampleUVFull, 0);
     uint fullDepthAsUIntHigh19 = compressDepth(fullDepth);
-    
+	
     uint packedAsUINTHigh19FullX = fullDepthAsUIntHigh19 | (currentPixelIndex.x & IndexLast13DigitsMask);
     uint packedAsUINTHigh19FullY = fullDepthAsUIntHigh19 | (currentPixelIndex.y & IndexLast13DigitsMask);
     uint packedAsUINTHigh19HalfTipX = halfTipDepthAsUIntHigh19 | (currentPixelIndex.x & IndexLast13DigitsMask);
     uint packedAsUINTHigh19HalfTipY = halfTipDepthAsUIntHigh19 | (currentPixelIndex.y & IndexLast13DigitsMask);
     uint packedAsUINTHigh19HalfTopX = halfTopDepthAsUIntHigh19 | (currentPixelIndex.x & IndexLast13DigitsMask);
     uint packedAsUINTHigh19HalfTopY = halfTopDepthAsUIntHigh19 | (currentPixelIndex.y & IndexLast13DigitsMask);
-    
-    {
+	
+	{
         bool bIsValidFullPixel = all(fullTracedIndex < int2(dimensions)) && all(fullTracedIndex >= int2(0, 0));
         if (bIsValidFullPixel)
         {
